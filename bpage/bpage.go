@@ -7,6 +7,12 @@ import (
 )
 
 type ID uint64
+
+type IDs []ID
+func (s IDs) Len() int           { return len(s) }
+func (s IDs) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s IDs) Less(i, j int) bool { return s[i] < s[j] }
+
 type TxID uint64
 
 // page has 4 sorts.
