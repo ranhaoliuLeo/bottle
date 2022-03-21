@@ -4,49 +4,28 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sort"
 	"sync"
 	"syscall"
 	"unsafe"
 
 	"github.com/ranhaoliuLeo/bottle/bpage"
+	"github.com/ranhaoliuLeo/bottle/bmeta"
+	"github.com/ranhaoliuLeo/bottle/bfreelist"
+	"github.com/ranhaoliuLeo/bottle/constant"
 )
-
-// magic num indicate that file is bottle db file
-const magic uint32 = 0xED0CDBBD
-const version = 1
-
-// 256TB
-const maxMapSize = 0xFFFFFFFFFFFF
-const maxMmapStep = 1 << 30 // 1GB
-// maxAllocSize is the size used when creating array pointers.
-const maxAllocSize = 0x7FFFFFFF
 
 type DB struct {
 	pageSize  int
 	file      *os.File
 	pagePool  sync.Pool
-	freelist  *freelist
+	freelist  *bfreelist.Data
 	mmaplock  sync.RWMutex // Protects mmap access during remapping.
 	dataref   []byte
-	data      *[maxMapSize]byte
+	data      *[constant.MaxMapSize]byte
 	datasz    int
-	meta0     *bpage.Meta
-	meta1     *bpage.Meta
+	meta0     *bmeta.Data
+	meta1     *bmeta.Data
 	MmapFlags int
-}
-
-type freelist struct {
-	ids     []bpage.ID                // all free and available free page ids.
-	pending map[bpage.TxID][]bpage.ID // mapping of soon-to-be free page ids by tx.
-	cache   map[bpage.ID]bool         // fast lookup of all free and pending page ids.
-}
-
-func newFreelist() *freelist {
-	return &freelist{
-		pending: make(map[bpage.TxID][]bpage.ID),
-		cache:   make(map[bpage.ID]bool),
-	}
 }
 
 func Open(path string, mode os.FileMode) (*DB, error) {
@@ -72,7 +51,7 @@ func Open(path string, mode os.FileMode) (*DB, error) {
 		// so we should read the first files meta page.
 		buf := make([]byte, 0x1000)
 		if _, err := dbIns.file.ReadAt(buf[:], 0); err != nil {
-			meta := dbIns.getPageFromBuffer(buf, 0).GetMeta()
+			meta := bmeta.Get(dbIns.getPageFromBuffer(buf, 0))
 			if err := meta.Check(); err != nil {
 				log.Printf("Err Check db file, err: %v, maybe page size was wrong. plz try agin", err)
 				dbIns.pageSize = os.Getpagesize()
@@ -92,8 +71,8 @@ func Open(path string, mode os.FileMode) (*DB, error) {
 		return nil, err
 	}
 
-	dbIns.freelist = newFreelist()
-	dbIns.freelist.read(dbIns.page(dbIns.meta().Freelist))
+	dbIns.freelist = bfreelist.New()
+	dbIns.freelist.Read(dbIns.page(dbIns.meta().Freelist))
 
 	return dbIns, nil
 }
@@ -112,12 +91,12 @@ func (db *DB) init() error {
 		page := db.getPageFromBuffer(buf, pid)
 		page.ID = pid
 		page.Flags = bpage.MetaFlag
-		meta := page.GetMeta()
-		meta.Magic = magic
-		meta.Version = version
+		meta := bmeta.Get(page)
+		meta.Magic = bmeta.Magic
+		meta.Version = constant.Version
 		meta.PageSize = db.pageSize
 		meta.Freelist = 2
-		meta.Root = bpage.Bucket{Root: 3}
+		meta.Root = bmeta.Bucket{Root: 3}
 		meta.ID = 4
 		meta.TxID = bpage.TxID(i)
 		meta.Checksum = meta.GenSum64()
@@ -179,8 +158,8 @@ func (db *DB) mmap(minsz int) error {
 	}
 
 	// Save references to the meta pages.
-	db.meta0 = db.page(0).GetMeta()
-	db.meta1 = db.page(1).GetMeta()
+	db.meta0 = bmeta.Get(db.page(0))
+	db.meta1 = bmeta.Get(db.page(1))
 
 	// Validate the meta pages. We only return an error if both meta pages fail
 	// validation, since meta0 failing validation means that it wasn't saved
@@ -210,14 +189,14 @@ func (db *DB) mmapSize(size int) (int, error) {
 	}
 
 	// Verify the requested size is not above the maximum allowed.
-	if size > maxMapSize {
+	if size > constant.MaxMapSize {
 		return 0, fmt.Errorf("mmap too large")
 	}
 
 	// If larger than 1GB then grow by 1GB at a time.
 	sz := int64(size)
-	if remainder := sz % int64(maxMmapStep); remainder > 0 {
-		sz += int64(maxMmapStep) - remainder
+	if remainder := sz % int64(constant.MaxMmapStep); remainder > 0 {
+		sz += int64(constant.MaxMmapStep) - remainder
 	}
 
 	// Ensure that the mmap size is a multiple of the page size.
@@ -228,8 +207,8 @@ func (db *DB) mmapSize(size int) (int, error) {
 	}
 
 	// If we've exceeded the max size then only grow up to the max size.
-	if sz > maxMapSize {
-		sz = maxMapSize
+	if sz > constant.MaxMapSize {
+		sz = constant.MaxMapSize
 	}
 
 	return int(sz), nil
@@ -272,7 +251,7 @@ func mmap(db *DB, sz int) error {
 
 	// Save the original byte slice and convert to a byte array pointer.
 	db.dataref = b
-	db.data = (*[maxMapSize]byte)(unsafe.Pointer(&b[0]))
+	db.data = (*[constant.MaxMapSize]byte)(unsafe.Pointer(&b[0]))
 	db.datasz = sz
 	return nil
 }
@@ -292,47 +271,8 @@ func (db *DB) page(id bpage.ID) *bpage.Data {
 	return (*bpage.Data)(unsafe.Pointer(&db.data[pos]))
 }
 
-// read initializes the freelist from a freelist page.
-func (f *freelist) read(p *bpage.Data) {
-	// If the page.count is at the max uint16 value (64k) then it's considered
-	// an overflow and the size of the freelist is stored as the first element.
-	idx, count := 0, int(p.Count)
-	if count == 0xFFFF {
-		idx = 1
-		count = int(((*[maxAllocSize]bpage.ID)(unsafe.Pointer(&p.Ptr)))[0])
-	}
-
-	// Copy the list of page ids from the freelist.
-	if count == 0 {
-		f.ids = nil
-	} else {
-		ids := ((*[maxAllocSize]bpage.ID)(unsafe.Pointer(&p.Ptr)))[idx:count]
-		f.ids = make([]bpage.ID, len(ids))
-		copy(f.ids, ids)
-
-		// Make sure they're sorted.
-		sort.Sort(bpage.IDs(f.ids))
-	}
-
-	// Rebuild the page cache.
-	f.reindex()
-}
-
-// reindex rebuilds the free cache based on available and pending free lists.
-func (f *freelist) reindex() {
-	f.cache = make(map[bpage.ID]bool, len(f.ids))
-	for _, id := range f.ids {
-		f.cache[id] = true
-	}
-	for _, pendingIDs := range f.pending {
-		for _, pendingID := range pendingIDs {
-			f.cache[pendingID] = true
-		}
-	}
-}
-
 // meta retrieves the current meta page reference.
-func (db *DB) meta() *bpage.Meta {
+func (db *DB) meta() *bmeta.Data {
 	// We have to return the meta with the highest txid which doesn't fail
 	// validation. Otherwise, we can cause errors when in fact the database is
 	// in a consistent state. metaA is the one with the higher txid.
